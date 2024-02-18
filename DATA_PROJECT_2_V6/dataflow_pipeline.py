@@ -12,6 +12,7 @@ from apache_beam import window
 from datetime import datetime, timedelta
 from apache_beam.io.gcp.bigquery import WriteToBigQuery, BigQueryDisposition
 
+
 # Import Common Libraries
 import argparse
 import requests
@@ -88,7 +89,6 @@ def format_message_coches(message):
     # Verifica si 'timestamp' está en el mensaje
     if 'timestamp' not in message:
         logging.error(f"Mensaje sin timestamp: {message}")
-        # Decide cómo manejar este caso: omitir el mensaje, usar un valor predeterminado, etc.
         return None
     
     temporal_key = assign_temporal_key(message['timestamp'], 'hour')
@@ -98,6 +98,8 @@ def format_message_coches(message):
         'lat': message['lat'],
         'lon': message['lon'],
         'plazas_disponibles': message['plazas_disponibles'],
+        'dinero_recaudado': message.get('dinero_recaudado', 0.0),
+        'personas_transportadas': message.get('personas_transportadas', 0),
         'timestamp': message['timestamp']
     })
     
@@ -127,7 +129,6 @@ def print_data(element):
     print("Datos finales enviados a BigQuery:", element)
     return element
 
-
 def log_message(message):
     logging.info(f"Mensaje recibido: {message}")
     return message
@@ -139,46 +140,65 @@ def format_message_matches(message):
         'destino_coche': message['destino_coche'],
         'plazas_disponibles': int(message['plazas_disponibles']),  # Asegúrate de que sea un entero
         'persona_id': str(message['persona_id']),  # Convierte a cadena si es necesario
-        'distance': float(message['distance'])  # Asegúrate de que sea un float
+        'distance': float(message['distance']),  # Asegúrate de que sea un float
+        'dinero_recaudado': message['dinero_recaudado'],
+        'personas_transportadas': message['personas_transportadas']
+    
     }
 
 
 
 """ Dataflow Process """
 
-DISTANCIA_MAXIMA=3
-class BuscarCoincidenciasFn(beam.DoFn):
+DISTANCIA_MAXIMA = 3
+COSTO_POR_KM = 0.8
+class BuscarCoincidenciasFn(DoFn):
     def process(self, element, *args, **kwargs):
         _, datos_agrupados = element
         coches = datos_agrupados['coches']
         personas = datos_agrupados['personas']
 
-        coincidencias = []
-        for coche in coches:
-            for persona in personas:
-                distance = haversine(coche['lat'], coche['lon'], persona['lat'], persona['lon'])
+        # Almacenar las personas ya asignadas para evitar duplicados
+        personas_asignadas = set()
 
-                if distance <= DISTANCIA_MAXIMA:
-                    logging.info(f"Coincidencia encontrada: Coche {coche['car_id']} y Persona {persona['persona_id']} a una distancia de {distance:.2f} km")
-                    coincidencia = {
+        for coche in coches:
+            # Saltar este coche si no quedan plazas disponibles
+            if coche['plazas_disponibles'] <= 0:
+                continue
+
+            coincidencia_seleccionada = None
+            menor_distancia = float('inf')
+
+            for persona in personas:
+                # Saltar si la persona ya ha sido asignada a un coche
+                if persona['persona_id'] in personas_asignadas:
+                    continue
+
+                distance = haversine(coche['lat'], coche['lon'], persona['lat'], persona['lon'])
+                costo_viaje = distance * COSTO_POR_KM
+
+                # Verificar si la persona está dentro del rango y presupuesto, y si es la más cercana hasta ahora
+                if distance <= DISTANCIA_MAXIMA and costo_viaje <= persona['presupuesto'] and distance < menor_distancia:
+                    menor_distancia = distance
+                    coincidencia_seleccionada = {
                         'car_id': coche['car_id'],
                         'destino_coche': coche['destino_coche'],
-                        'plazas_disponibles': coche['plazas_disponibles'],
+                        'plazas_disponibles': coche['plazas_disponibles'] - 1,  # Restar una plaza disponible
                         'persona_id': persona['persona_id'],
-                        'distanceDelPasajero': distance
+                        'distanceDelPasajero': round(distance, 2),
+                        'dinero_recaudado': round(costo_viaje, 2),
+                        'personas_transportadas': 1  # Inicializar como 1 ya que se encontró una coincidencia
                     }
-                    coincidencias.append(coincidencia)
+                    personas_asignadas.add(persona['persona_id'])
 
-        # Selecciona la coincidencia más cercana (menor distancia)
-        if coincidencias:
-            coincidencia_seleccionada = min(coincidencias, key=lambda x: x['distanceDelPasajero'])
-            yield coincidencia_seleccionada
-
-
-
-
-
-
+                    # Emitir la coincidencia seleccionada si se encontró alguna
+                    if coincidencia_seleccionada:
+                        # Actualizar el estado del coche
+                        coche['plazas_disponibles'] = coincidencia_seleccionada['plazas_disponibles']
+                        coche['dinero_recaudado'] += coincidencia_seleccionada['dinero_recaudado']
+                        yield coincidencia_seleccionada
+                
+                
 def run():
 
     """ Input Arguments"""
@@ -209,7 +229,7 @@ def run():
         save_main_session=True, streaming=True, project=args.project_id)
 
     # Pipeline
-    window_duration = 0.2 #en minutos (definir tiempos)
+    window_duration = 0.3 #en minutos (definir tiempos)
     with beam.Pipeline(argv=pipeline_opts, options=options) as p:
     # Datos de coches
         coches = (
@@ -235,20 +255,20 @@ def run():
             | "Agrupar coches y personas por clave temporal" >> beam.CoGroupByKey()
         )
         
-            #Aplica FindMatchFn para procesar los datos agrupados
+             #Aplica FindMatchFn para procesar los datos agrupados
         coincidencias = (
-              datos_agrupados 
-            | "Buscar coincidencias" >> beam.ParDo(BuscarCoincidenciasFn()))
+               datos_agrupados 
+             | "Buscar coincidencias" >> beam.ParDo(BuscarCoincidenciasFn()))
         #coincidencias | 'Debug Print' >> beam.Map(debug_print)
         coincidencias | 'Print Data' >> beam.Map(print_data)
-        schema = 'car_id:STRING, destino_coche:STRING, plazas_disponibles:INTEGER, persona_id:STRING, distanceDelPasajero:FLOAT'
+        schema = 'car_id:STRING, destino_coche:STRING, plazas_disponibles:INTEGER, persona_id:STRING, distanceDelPasajero:FLOAT, personas_transportadas:INTEGER, dinero_recaudado:FLOAT'
         coincidencias | "Escribir en BigQuery" >> WriteToBigQuery(
-                table='midataset_coches.matches',
-                schema=schema,
-                create_disposition=BigQueryDisposition.CREATE_IF_NEEDED,
-                write_disposition=BigQueryDisposition.WRITE_APPEND,
-                project='civic-summer-413119'
-            )
+                 table='midataset_coches.matches',
+                 schema=schema,
+                 create_disposition=BigQueryDisposition.CREATE_IF_NEEDED,
+                 write_disposition=BigQueryDisposition.WRITE_APPEND,
+                 project='civic-summer-413119'
+             )
     
         
         
